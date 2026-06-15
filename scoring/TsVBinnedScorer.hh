@@ -58,6 +58,7 @@ protected:
 	G4bool fOutputToRoot;
 	G4bool fOutputToXml;
 	G4bool fOutputToDicom;
+	G4bool fOutputToMhd;
 	G4String fVHOutFileSpec1;
 	G4String fVHOutFileSpec2;
 
@@ -101,8 +102,11 @@ private:
 	void PrintHeader(std::ostream&);
 	void PrintASCII(std::ostream& a=G4cout);
 	void PrintBinary(std::ostream& a=G4cout);
+	void PrintMHDHeader(std::ostream&);
+	void PrintMHDData(std::ostream&);
 	void PrintOneValueToASCII(std::ostream& ofile);
 	void PrintOneValueToBinary(G4int idx, G4double* data);
+	G4double GetOneValueForMHD(G4int idx);
 	void PrintVHHeader();
 	void PrintVHHeader(std::ostream&);
 	void PrintVHASCII(std::ostream& a=G4cout);
@@ -175,6 +179,8 @@ private:
 	G4bool fReadBackHasStandardDeviation;
 	G4bool fReadBackHasMin;
 	G4bool fReadBackHasMax;
+
+	G4bool fMHDOutputCompressed;
 
 	G4String fColorBy;
 	std::vector<G4String> fColorNames;

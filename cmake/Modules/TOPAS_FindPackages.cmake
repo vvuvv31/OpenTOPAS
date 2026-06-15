@@ -42,3 +42,4 @@ find_package (GDCM REQUIRED)
 message(STATUS "Found GDCM v${GDCM_VERSION_MAJOR}.${GDCM_VERSION_MINOR}")
 
 include (${GDCM_USE_FILE})
+find_package (ZLIB)

@@ -36,6 +36,7 @@
 #include "TsParameterManager.hh"
 #include "TsMaterialManager.hh"
 #include "TsGeometryManager.hh"
+#include "TsBox.hh"
 #include "TsVGeometryComponent.hh"
 #include "TsScoringManager.hh"
 
@@ -64,12 +65,27 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+#include <limits>
+
+#ifdef TOPAS_HAS_ZLIB
+#include <zlib.h>
+#endif
+
+namespace {
+G4String GetFileNamePart(const G4String& fileSpec)
+{
+    const size_t pos = fileSpec.find_last_of("/\\");
+    if (pos == G4String::npos)
+        return fileSpec;
+    return fileSpec.substr(pos + 1);
+}
+}
 
 TsVBinnedScorer::TsVBinnedScorer(TsParameterManager* pM, TsMaterialManager* mM, TsGeometryManager* gM, TsScoringManager* scM, TsExtensionManager* eM,
                                  G4String scorerName, G4String quantity, G4String outFileName, G4bool isSubScorer)
 : TsVScorer(pM, mM, gM, scM, eM, scorerName, quantity, outFileName, isSubScorer),
 fNeedToUpdateFileSpecs(true), fOutFileSpec1(""), fOutFileSpec2(""),
-fOutputToBinary(false), fOutputToCsv(false), fOutputToRoot(false), fOutputToXml(false), fOutputToDicom(false),
+fOutputToBinary(false), fOutputToCsv(false), fOutputToRoot(false), fOutputToXml(false), fOutputToDicom(false), fOutputToMhd(false),
 fVHOutFileSpec1(""), fVHOutFileSpec2(""),
 fReferencedDicomPatient(NULL),
 fUnitName("unspecified"), fUnitWasSet(false),
@@ -84,6 +100,7 @@ fAccumulateSecondMoment(false), fAccumulateMean(false), fAccumulateCount(false),
 fNumberOfOutputColumns(0), fOutputPosition(0), fRestoreResultsFromFile(false), fNReadBackValues(0),
 fReadBackHasSum(false), fReadBackHasMean(false), fReadBackHasHistories(false), fReadBackHasCountInBin(false),
 fReadBackHasSecondMoment(false), fReadBackHasVariance(false), fReadBackHasStandardDeviation(false), fReadBackHasMin(false), fReadBackHasMax(false),
+fMHDOutputCompressed(false),
 fColorBy(""), fColorByTotal(0), fSparsify(false), fSparsifyThreshold(0.), fSingleIndex(false),
 fSumLimit(0.), fStandardDeviationLimit(0.), fRelativeSDLimit(0.), fCountLimit(0), fRepeatSequenceTestBin(0)
 {
@@ -92,6 +109,19 @@ fSumLimit(0.), fStandardDeviationLimit(0.), fRelativeSDLimit(0.), fCountLimit(0)
     else if (fOutFileType == "root") fOutputToRoot = true;
     else if (fOutFileType == "xml") fOutputToXml = true;
     else if (fOutFileType == "dicom") fOutputToDicom = true;
+    else if (fOutFileType == "mhd") fOutputToMhd = true;
+
+    if (fOutputToMhd && fPm->ParameterExists(GetFullParmName("MHDOutputCompressed")))
+        fMHDOutputCompressed = fPm->GetBooleanParameter(GetFullParmName("MHDOutputCompressed"));
+
+#ifndef TOPAS_HAS_ZLIB
+    if (fMHDOutputCompressed) {
+        G4cerr << "Topas is exiting due to a serious error in scoring." << G4endl;
+        G4cerr << GetName() << " requested compressed MHD output, but TOPAS was built without zlib." << G4endl;
+        G4cerr << "Install zlib and rerun CMake, or set " << GetFullParmName("MHDOutputCompressed") << " to False." << G4endl;
+        fPm->AbortSession(1);
+    }
+#endif
     
     G4String* reportValues;
     
@@ -719,11 +749,45 @@ void TsVBinnedScorer::PostConstructor()
             }
         }
     }
+
+    if (fOutputToMhd) {
+        TsBox* scorerBox = dynamic_cast<TsBox*>(fComponent);
+        if (!scorerBox) {
+            G4cerr << "Topas is exiting due to a serious error in scoring." << G4endl;
+            G4cerr << GetName() << " uses MHD output, which is only supported for TsBox-derived voxelized components, including patient geometries." << G4endl;
+            fPm->AbortSession(1);
+        }
+
+        if (fPm->ParameterExists(GetFullParmName("Surface"))) {
+            G4cerr << "Topas is exiting due to a serious error in scoring." << G4endl;
+            G4cerr << GetName() << " uses MHD output, which is only supported for volume scorers." << G4endl;
+            fPm->AbortSession(1);
+        }
+
+        if (fNumberOfOutputColumns != 1 || fReportCVolHist || fReportDVolHist) {
+            G4cerr << "Topas is exiting due to a serious error in scoring." << G4endl;
+            G4cerr << GetName() << " uses MHD output, which requires exactly one non-volume-histogram Report value." << G4endl;
+            G4cerr << "For example: sv:Sc/" << GetName() << "/Report = 1 \"Sum\"" << G4endl;
+            fPm->AbortSession(1);
+        }
+
+        if (fNEorTBins != 0) {
+            G4cerr << "Topas is exiting due to a serious error in scoring." << G4endl;
+            G4cerr << GetName() << " uses MHD output, which does not support EBin or TimeBins output." << G4endl;
+            fPm->AbortSession(1);
+        }
+
+        if (fSparsify) {
+            G4cerr << "Topas is exiting due to a serious error in scoring." << G4endl;
+            G4cerr << GetName() << " uses MHD output, which does not support Sparsify." << G4endl;
+            fPm->AbortSession(1);
+        }
+    }
     
     if (fSuppressStandardOutputHandling) {
         fNeedToUpdateFileSpecs = false;
     } else {
-        if (!fOutputToBinary && !fOutputToCsv && !fOutputToRoot && !fOutputToXml && !fOutputToDicom) {
+        if (!fOutputToBinary && !fOutputToCsv && !fOutputToRoot && !fOutputToXml && !fOutputToDicom && !fOutputToMhd) {
             G4cerr << "Topas is exiting due to a serious error in scoring setup." << G4endl;
             G4cerr << "The scorer named " << GetName() << " has unsupported OutputType: "
             << fPm->GetStringParameter(GetFullParmName("OutputType")) << G4endl;
@@ -733,7 +797,7 @@ void TsVBinnedScorer::PostConstructor()
             if (quantityNameLower == "phasespace")
                 G4cerr << "OutputType must be either ASCII, Binary or Limited." << G4endl;
             else
-                G4cerr << "OutputType must be either CSV, Binary, Root, XML or Dicom." << G4endl;
+                G4cerr << "OutputType must be either CSV, Binary, Root, XML, Dicom or MHD." << G4endl;
             fPm->AbortSession(1);
         }
         
@@ -765,6 +829,11 @@ void TsVBinnedScorer::PostConstructor()
                 } else if (fOutputToDicom) {
                     G4String outFileExt1 = ".dcm";
                     fOutFileSpec1 = ConfirmCanOpen(fOutFileName, outFileExt1, increment);
+                } else if (fOutputToMhd) {
+                    G4String outFileExt1 = ".mhd";
+                    G4String outFileExt2 = fMHDOutputCompressed ? ".zraw" : ".raw";
+                    fOutFileSpec1 = ConfirmCanOpen(fOutFileName, outFileExt1, increment);
+                    fOutFileSpec2 = ConfirmCanOpen(fOutFileName, outFileExt2, increment);
                 }
                 
                 fNeedToUpdateFileSpecs = false;
@@ -1849,6 +1918,11 @@ void TsVBinnedScorer::Output()
         } else if (fOutputToDicom) {
             G4String outFileExt1 = ".dcm";
             fOutFileSpec1 = ConfirmCanOpen(outFileNameWithRun, outFileExt1, increment);
+        } else if (fOutputToMhd) {
+            G4String outFileExt1 = ".mhd";
+            G4String outFileExt2 = fMHDOutputCompressed ? ".zraw" : ".raw";
+            fOutFileSpec1 = ConfirmCanOpen(outFileNameWithRun, outFileExt1, increment);
+            fOutFileSpec2 = ConfirmCanOpen(outFileNameWithRun, outFileExt2, increment);
         }
     }
     
@@ -1936,6 +2010,26 @@ void TsVBinnedScorer::Output()
                 std::ofstream ofile(fOutFileSpec2, std::ios::out | std::ios::binary);
                 if (ofile) {
                     PrintBinary(ofile);
+                    ofile.close();
+                } else {
+                    G4cerr << "Topas is exiting due to a serious error in scoring." << G4endl;
+                    G4cerr << "Output file: " << fOutFileSpec2 << " cannot be opened for Scorer name: " << GetName() << G4endl;
+                    fPm->AbortSession(1);
+                }
+            } else if (fOutputToMhd) {
+                std::ofstream hfile(fOutFileSpec1);
+                if (hfile) {
+                    PrintMHDHeader(hfile);
+                    hfile.close();
+                } else {
+                    G4cerr << "Topas is exiting due to a serious error in scoring." << G4endl;
+                    G4cerr << "Output file: " << fOutFileSpec1 << " cannot be opened for Scorer name: " << GetName() << G4endl;
+                    fPm->AbortSession(1);
+                }
+
+                std::ofstream ofile(fOutFileSpec2, std::ios::out | std::ios::binary);
+                if (ofile) {
+                    PrintMHDData(ofile);
                     ofile.close();
                 } else {
                     G4cerr << "Topas is exiting due to a serious error in scoring." << G4endl;
@@ -2696,6 +2790,132 @@ void TsVBinnedScorer::PrintBinary(std::ostream& ofile)
     }
     ofile.write( (char*) data, size*sizeof(G4double));
     delete[] data;
+}
+
+
+void TsVBinnedScorer::PrintMHDHeader(std::ostream& ofile)
+{
+    TsBox* scorerBox = dynamic_cast<TsBox*>(fComponent);
+    if (!scorerBox) {
+        G4cerr << "Topas is exiting due to a serious error in scoring." << G4endl;
+        G4cerr << "Scorer: " << GetName() << " tried to write MHD output, but is not attached to a TsBox or Patient component." << G4endl;
+        fPm->AbortSession(1);
+    }
+
+    G4double voxelSizeX = fComponent->GetFullWidth(0) / fNi;
+    G4double voxelSizeY = fComponent->GetFullWidth(1) / fNj;
+    G4double voxelSizeZ = fComponent->GetFullWidth(2) / fNk;
+
+    G4Point3D scorerCenterRelToWorld = *(fComponent->GetTransRelToWorld());
+    G4Point3D firstVoxelRelToScorer = scorerBox->GetTransFirstVoxelCenterRelToComponentCenter();
+    G4RotationMatrix rot = fComponent->GetRotRelToWorld()->inverse();
+    G4Transform3D scorerToWorld(rot, scorerCenterRelToWorld);
+    G4Point3D firstVoxelRelToWorld = scorerToWorld * firstVoxelRelToScorer;
+
+    uint16_t endianTest = 1;
+    G4bool isMSB = (*reinterpret_cast<char*>(&endianTest) == 0);
+
+    ofile << "ObjectType = Image" << G4endl;
+    ofile << "NDims = 3" << G4endl;
+    ofile << "BinaryData = True" << G4endl;
+    ofile << "BinaryDataByteOrderMSB = " << (isMSB ? "True" : "False") << G4endl;
+    ofile << "CompressedData = " << (fMHDOutputCompressed ? "True" : "False") << G4endl;
+    ofile << "TransformMatrix = "
+          << rot.xx() << " " << rot.xy() << " " << rot.xz() << " "
+          << rot.yx() << " " << rot.yy() << " " << rot.yz() << " "
+          << rot.zx() << " " << rot.zy() << " " << rot.zz() << G4endl;
+    ofile << "Offset = "
+          << firstVoxelRelToWorld.x() / mm << " "
+          << firstVoxelRelToWorld.y() / mm << " "
+          << firstVoxelRelToWorld.z() / mm << G4endl;
+    ofile << "CenterOfRotation = 0 0 0" << G4endl;
+    ofile << "ElementSpacing = "
+          << voxelSizeX / mm << " "
+          << voxelSizeY / mm << " "
+          << voxelSizeZ / mm << G4endl;
+    ofile << "DimSize = " << fNi << " " << fNj << " " << fNk << G4endl;
+    ofile << "ElementType = MET_DOUBLE" << G4endl;
+    ofile << "ElementDataFile = " << GetFileNamePart(fOutFileSpec2) << G4endl;
+}
+
+
+void TsVBinnedScorer::PrintMHDData(std::ostream& ofile)
+{
+    std::vector<G4double> data;
+    data.reserve(fNDivisions);
+
+    for (int k = 0; k < fNk; k++) {
+        for (int j = 0; j < fNj; j++) {
+            for (int i = 0; i < fNi; i++) {
+                G4int idx = i*fNj*fNk+j*fNk+k;
+                data.push_back(GetOneValueForMHD(idx));
+            }
+        }
+    }
+
+    const size_t rawByteCount = data.size() * sizeof(G4double);
+    if (!fMHDOutputCompressed) {
+        ofile.write(reinterpret_cast<const char*>(data.data()), rawByteCount);
+        return;
+    }
+
+#ifdef TOPAS_HAS_ZLIB
+    if (rawByteCount > static_cast<size_t>(std::numeric_limits<uLong>::max())) {
+        G4cerr << "Topas is exiting due to a serious error in scoring." << G4endl;
+        G4cerr << "MHD compressed output for scorer " << GetName() << " is too large for zlib in one block." << G4endl;
+        fPm->AbortSession(1);
+    }
+
+    uLong sourceSize = static_cast<uLong>(rawByteCount);
+    uLongf compressedSize = compressBound(sourceSize);
+    std::vector<Bytef> compressedData(compressedSize);
+
+    int zResult = compress2(compressedData.data(), &compressedSize,
+                            reinterpret_cast<const Bytef*>(data.data()), sourceSize,
+                            Z_BEST_COMPRESSION);
+
+    if (zResult != Z_OK) {
+        G4cerr << "Topas is exiting due to a serious error in scoring." << G4endl;
+        G4cerr << "zlib compression failed for MHD scorer " << GetName() << " with error code: " << zResult << G4endl;
+        fPm->AbortSession(1);
+    }
+
+    ofile.write(reinterpret_cast<const char*>(compressedData.data()), compressedSize);
+#else
+    G4cerr << "Topas is exiting due to a serious error in scoring." << G4endl;
+    G4cerr << GetName() << " requested compressed MHD output, but TOPAS was built without zlib." << G4endl;
+    fPm->AbortSession(1);
+#endif
+}
+
+
+G4double TsVBinnedScorer::GetOneValueForMHD(G4int idx)
+{
+    CalculateOneValue(idx);
+
+    if (fReportValues[0] == 0)
+        return fSum;
+    else if (fReportValues[0] == 1)
+        return fMean;
+    else if (fReportValues[0] == 2)
+        return fScoredHistories;
+    else if (fReportValues[0] == 3)
+        return fCountInBin;
+    else if (fReportValues[0] == 4)
+        return fSecondMoment;
+    else if (fReportValues[0] == 5)
+        return fVariance;
+    else if (fReportValues[0] == 6)
+        return fStandardDeviation;
+    else if (fReportValues[0] == 7)
+        return fMin;
+    else if (fReportValues[0] == 8)
+        return fMax;
+
+    G4cerr << "Topas is exiting due to a serious error in scoring." << G4endl;
+    G4cerr << "MHD output for scorer " << GetName() << " received an unsupported Report value." << G4endl;
+    fPm->AbortSession(1);
+    return 0.;
 }
 
 
